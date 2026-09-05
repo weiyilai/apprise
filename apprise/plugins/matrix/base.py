@@ -38,7 +38,8 @@
 import contextlib
 from json import dumps, loads
 import re
-from time import time
+import threading
+from time import monotonic, time
 import uuid
 
 from markdown import markdown
@@ -63,6 +64,7 @@ from ...utils.parse import (
     validate_regex,
 )
 from ..base import NotifyBase
+from . import sas
 from .e2ee import (
     MATRIX_E2EE_SUPPORT,
     MatrixMegOlmSession,
@@ -256,6 +258,16 @@ class NotifyMatrix(NotifyBase):
     # key-shares skip devices that have no OTK available.
     default_e2ee_otk_replenish_threshold = 5
 
+    # Maximum time an opt-in verification bootstrap waits for SAS events.
+    default_autoverify_timeout_sec = 120
+
+    # Delay retries so each send does not repeat the full verification timeout.
+    default_autoverify_retry_cooldown_sec = 60 * 15
+
+    # Refresh trust daily instead of rewriting private identity data after
+    # every successful notification.
+    default_autoverify_refresh_interval_sec = 60 * 60 * 24
+
     # Used for server discovery
     discovery_base_key = "__discovery_base"
     discovery_identity_key = "__discovery_identity"
@@ -384,6 +396,11 @@ class NotifyMatrix(NotifyBase):
                 "type": "bool",
                 "default": True,
             },
+            "autoverify": {
+                "name": _("Automatic Device Verification"),
+                "type": "bool",
+                "default": False,
+            },
             "token": {
                 "alias_of": "token",
             },
@@ -404,6 +421,7 @@ class NotifyMatrix(NotifyBase):
         hsreq=None,
         webhook_path=None,
         e2ee=None,
+        autoverify=None,
         **kwargs,
     ):
         """Initialize Matrix Object."""
@@ -468,12 +486,29 @@ class NotifyMatrix(NotifyBase):
             self.webhook_path = f"/{self.webhook_path}"
         self.webhook_path = self.webhook_path.rstrip("/") or "/"
 
+        # Resolve autoverify first: requesting it implies e2ee=yes unless
+        # e2ee was explicitly supplied, so turning on automatic device
+        # verification never also requires spelling out e2ee=yes.
+        self.autoverify = (
+            self.template_args["autoverify"]["default"]
+            if autoverify is None
+            else parse_bool(autoverify)
+        )
+
         # End-to-end encryption (server mode only; requires cryptography)
         self.e2ee = (
-            self.template_args["e2ee"]["default"]
-            if e2ee is None
-            else parse_bool(e2ee)
+            parse_bool(e2ee)
+            if e2ee is not None
+            else (
+                True
+                if self.autoverify
+                else self.template_args["e2ee"]["default"]
+            )
         )
+
+        # Let only one notification poll for a verification request at a time.
+        # This prevents concurrent calls from accepting the same request.
+        self._autoverify_lock = threading.Lock()
 
         # Setup our mode
         self.mode = (
@@ -1028,6 +1063,14 @@ class NotifyMatrix(NotifyBase):
                     "messages will be sent unencrypted."
                 )
 
+        # Automatic verification is best-effort and does not decide delivery.
+        # Failed attempts remain unverified and retry on a later send.
+        if e2ee_capable and self.autoverify and not self._e2ee_auto_verify():
+            self.logger.warning(
+                "Matrix E2EE automatic device verification did not "
+                "complete; continuing without confirming device trust."
+            )
+
         # Plaintext attachment payloads for unencrypted rooms.
         # Lazy-initialized on the first unencrypted room so that purely
         # E2EE setups never upload attachments in plaintext.
@@ -1225,7 +1268,18 @@ class NotifyMatrix(NotifyBase):
                 has_error = True
                 continue
 
-        return not has_error
+        successful = not has_error
+        if (
+            successful
+            and e2ee_capable
+            and self.autoverify
+            and not self._e2ee_refresh_verified_state()
+        ):
+            self.logger.warning(
+                "Matrix E2EE verified device state could not be refreshed."
+            )
+
+        return successful
 
     def _send_attachments(self, attach):
         """Posts all of the provided attachments."""
@@ -1874,6 +1928,28 @@ class NotifyMatrix(NotifyBase):
 
         return None
 
+    @staticmethod
+    def _truncated_content(content):
+        """Return enough response content for a useful debug log entry."""
+        return (content or b"")[:2000]
+
+    @staticmethod
+    def _read_bounded(r, max_bytes):
+        """Read and close a response, returning ``None`` if it is too large."""
+        chunks = []
+        total = 0
+        try:
+            for chunk in r.iter_content(chunk_size=65536):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > max_bytes:
+                    return None
+                chunks.append(chunk)
+            return b"".join(chunks)
+        finally:
+            r.close()
+
     def _fetch(
         self,
         path,
@@ -1883,20 +1959,15 @@ class NotifyMatrix(NotifyBase):
         method="POST",
         url_override=None,
         ok_status=None,
+        timeout=None,
+        max_retry_wait=None,
+        max_response_bytes=None,
     ):
-        """Wrapper to request.post() to manage it's response better and
-        make the send() function cleaner and easier to maintain.
+        """Send a Matrix HTTP request and normalize its result.
 
-        This function always returns a 3-tuple:
-            (success, response, status_code)
-
-        The response is a dict when JSON is parseable, otherwise an empty
-        dict. The status_code defaults to 500 on local failures.
-
-        *ok_status* is an optional collection of additional HTTP status codes
-        to treat as success (no warning logged).  Use it for calls where a
-        non-200 response is expected and meaningful, e.g. 404 on a state-event
-        probe that returns "not found" = "feature not enabled".
+        Returns ``(success, response, status_code)``. Invalid JSON uses an
+        empty response. Optional arguments accept expected status codes and
+        limit request time, retry delays, or response size.
         """
 
         # Define our headers
@@ -1963,6 +2034,14 @@ class NotifyMatrix(NotifyBase):
         # Define how many attempts we'll make if we get caught in a
         # throttle event
         retries = self.default_retries if self.default_retries > 0 else 1
+
+        # Share one retry-wait budget across every 429 response in this call.
+        retry_deadline = (
+            monotonic() + max_retry_wait
+            if max_retry_wait is not None
+            else None
+        )
+
         while retries > 0:
             # Decrement our throttle retry count
             retries -= 1
@@ -1982,6 +2061,7 @@ class NotifyMatrix(NotifyBase):
 
             # Initialize our response object
             r = None
+            content = b""
 
             try:
                 r = fn(
@@ -1998,19 +2078,36 @@ class NotifyMatrix(NotifyBase):
                     params=params if params else None,
                     headers=headers,
                     verify=self.verify_certificate,
-                    timeout=self.request_timeout,
+                    timeout=(
+                        timeout
+                        if timeout is not None
+                        else self.request_timeout
+                    ),
                     allow_redirects=self.redirects,
+                    stream=max_response_bytes is not None,
                 )
 
                 # Store status code
                 status_code = r.status_code
 
+                if max_response_bytes is not None:
+                    content = self._read_bounded(r, max_response_bytes)
+                    if content is None:
+                        self.logger.warning(
+                            "Matrix response exceeded %d bytes; "
+                            "discarding it.",
+                            max_response_bytes,
+                        )
+                        return (False, {}, status_code)
+                else:
+                    content = r.content
+
                 self.logger.debug(
-                    "Matrix Response: code={}, {}".format(
-                        r.status_code, r.content
-                    )
+                    "Matrix Response: code=%s, %s",
+                    r.status_code,
+                    self._truncated_content(content),
                 )
-                response = loads(r.content)
+                response = loads(content)
 
                 if r.status_code == requests.codes.too_many_requests:
                     wait_ms = self.default_wait_ms
@@ -2024,14 +2121,37 @@ class NotifyMatrix(NotifyBase):
                         except KeyError:
                             pass
 
+                    if retry_deadline is not None:
+                        # Subtract earlier waits from the shared budget.
+                        remaining_wait = max(0.0, retry_deadline - monotonic())
+                        if remaining_wait <= 0:
+                            # Stop before another request when the budget ends.
+                            self.logger.warning(
+                                "Matrix server requested we throttle "
+                                "back, but our retry budget is "
+                                "exhausted; giving up."
+                            )
+                            return (False, response, status_code)
+                        wait_ms = min(wait_ms, remaining_wait * 1000)
+
                     self.logger.warning(
                         "Matrix server requested we throttle back "
                         "{}ms; retries left {}.".format(wait_ms, retries)
                     )
-                    self.logger.debug(f"Response Details:\r\n{r.content}")
+                    self.logger.debug(
+                        "Response Details:\r\n%r",
+                        (content or b"")[:2000],
+                    )
 
                     # Throttle for specified wait
                     self.throttle(wait=wait_ms / 1000)
+
+                    if (
+                        retry_deadline is not None
+                        and monotonic() >= retry_deadline
+                    ):
+                        # Do not retry when the wait consumed the budget.
+                        return (False, response, status_code)
 
                     # Try again
                     continue
@@ -2057,20 +2177,20 @@ class NotifyMatrix(NotifyBase):
                         )
                     )
 
-                    self.logger.debug(f"Response Details:\r\n{r.content}")
+                    self.logger.debug(
+                        "Response Details:\r\n%r",
+                        (content or b"")[:2000],
+                    )
 
                     # Return; we're done
                     return (False, response, status_code)
 
             except (AttributeError, TypeError, ValueError):
-                # This gets thrown if we can't parse our JSON Response
-                #  - ValueError = r.content is Unparsable
-                #  - TypeError = r.content is None
-                #  - AttributeError = r is None
+                # Reject missing or invalid JSON responses.
                 self.logger.warning("Invalid response from Matrix server.")
                 self.logger.debug(
                     "Response Details:\r\n%r",
-                    b"" if not r else (r.content or b""),
+                    content or b"",
                 )
                 return (False, {}, status_code)
 
@@ -2132,25 +2252,59 @@ class NotifyMatrix(NotifyBase):
         )
         return result
 
+    def _e2ee_binding_key(self):
+        """Return the identity shared by this device and E2EE account.
+
+        Keys uploaded status must match the current Matrix device identity
+        and the account keys we are about to use. This lets us recover from
+        cached state where the homeserver assigned a different device_id or
+        where the local E2EE account changed.  A changed user, device, or
+        account key must not reuse cached trust.
+        """
+        if self._e2ee_account is None:
+            # No account means there is no reusable encrypted identity.
+            return ""
+
+        # Include every value that must stay stable for cached trust.
+        return "{}|{}|{}|{}".format(
+            self.user_id or "",
+            self.device_id or "",
+            self._e2ee_account.identity_key,
+            self._e2ee_account.signing_key,
+        )
+
+    def _e2ee_auto_verify(self):
+        """Automatically complete one same-user SAS verification.
+
+        This delegates the opt-in bootstrap to the Matrix SAS helper.
+        """
+        return sas.auto_verify(self)
+
+    def _e2ee_refresh_verified_state(self):
+        """Extend SAS verification trust after a successful send.
+
+        The Matrix SAS helper refreshes only identity-related state.
+        """
+        return sas.refresh_verified_state(self)
+
     def _e2ee_setup(self):
         """Ensure the E2EE device account exists and keys are uploaded.
 
-        Creates a new :class:`MatrixOlmAccount` if one does not yet
-        exist in the persistent store, then calls
-        :meth:`_e2ee_upload_keys` if the server has not yet received
-        our device keys for the current access token.
-
-        Returns ``True`` on success, ``False`` on failure.
+        Restores or creates an account, then uploads any missing keys.
+        Returns ``True`` when the account is ready.
         """
         if self._e2ee_account is None:
+            # Prefer a saved identity so Matrix sees the same device again.
             acct_data = self.store.get("e2ee_account")
             if acct_data:
                 try:
                     self._e2ee_account = MatrixOlmAccount.from_dict(acct_data)
                 except Exception:
+                    # Invalid saved keys are replaced during normal setup.
                     self._e2ee_account = None
 
             if self._e2ee_account is None:
+                # First use or invalid storage requires a fresh local identity.
                 self._e2ee_account = MatrixOlmAccount()
                 self.store.set(
                     "e2ee_account",
@@ -2158,21 +2312,8 @@ class NotifyMatrix(NotifyBase):
                     expires=self.default_cache_expiry_sec,
                 )
 
-        # Keys uploaded status must match the current Matrix device identity
-        # and the account keys we are about to use. This lets us recover from
-        # cached state where the homeserver assigned a different device_id or
-        # where the local E2EE account changed.
-        current_binding = (
-            "{}|{}|{}|{}".format(
-                self.user_id or "",
-                self.device_id or "",
-                self._e2ee_account.identity_key,
-                self._e2ee_account.signing_key,
-            )
-            if self._e2ee_account is not None
-            else ""
-        )
-        if self.store.get("e2ee_device_binding") != current_binding:
+        # Discard upload state when the server device or local account changes.
+        if self.store.get("e2ee_device_binding") != self._e2ee_binding_key():
             self.store.clear("e2ee_keys_uploaded")
 
         if not self.store.get("e2ee_keys_uploaded"):
@@ -2224,12 +2365,7 @@ class NotifyMatrix(NotifyBase):
         )
         self.store.set(
             "e2ee_device_binding",
-            "{}|{}|{}|{}".format(
-                self.user_id,
-                self.device_id,
-                self._e2ee_account.identity_key,
-                self._e2ee_account.signing_key,
-            ),
+            self._e2ee_binding_key(),
             expires=self.default_cache_expiry_sec,
         )
 
@@ -3305,6 +3441,8 @@ class NotifyMatrix(NotifyBase):
 
         if not self.e2ee:
             params["e2ee"] = "no"
+        if self.autoverify:
+            params["autoverify"] = "yes"
 
         # Extend our parameters
         params.update(self.url_parameters(privacy=privacy, *args, **kwargs))
@@ -3401,6 +3539,9 @@ class NotifyMatrix(NotifyBase):
         # E2EE flag
         if "e2ee" in results["qsd"]:
             results["e2ee"] = parse_bool(results["qsd"]["e2ee"])
+
+        if "autoverify" in results["qsd"]:
+            results["autoverify"] = parse_bool(results["qsd"]["autoverify"])
 
         # Get our mode
         results["mode"] = results["qsd"].get("mode")
